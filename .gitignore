@@ -1,0 +1,9 @@
+.DS_Store
+build/
+sdkconfig.old
+sdkconfig.bak
+managed_components/
+*.swp
+.idea/
+.vscode/
+dependencies.lock
