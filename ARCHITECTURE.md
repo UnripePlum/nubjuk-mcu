@@ -1,6 +1,8 @@
 # MCU — 모듈 아키텍처
 
-ESP32-S3 단일 디바이스에서 음성 → intent → motion 전체를 수행. 외부와는 viewer (WS 서버) + brain (WS 클라이언트, Phase 4+) 통신.
+ESP32-S3 단일 디바이스에서 음성 → intent → motion 전체 흐름을 조율. 외부와는 viewer (WS 서버) + brain (WS 클라이언트, P1 부터 필수) 통신.
+
+> **2026-04-27 PIVOT**: 원래 P1 wake = Picovoice Porcupine, sti = Picovoice Rhino 가정이었으나 Picovoice 가 ESP32-S3 (Xtensa) 미지원 발견. Wake = microWakeWord 한국어 (TFLite Micro), STI = brain (WS to RPi) 로 변경. brain 도입이 P4 → P1 으로 이동. 인터페이스 (`wake_engine_t`, `sti_engine_t`) 는 그대로, 구현체만 swap. 자세한 reasoning 은 `DECISIONS.md` 2026-04-27 entry 참고. 아래 Mermaid 라벨은 cosmetic 으로 남아있으며 향후 정리 예정.
 
 ---
 
@@ -190,14 +192,14 @@ stateDiagram-v2
 
 | Phase | 활성 구현 | 비활성 |
 |-------|---------|------|
-| 1 | wake_porcupine + sti_rhino + LogMotionController | ws_server, brain, motor |
-| 2 | + ws_viewer_server (esp_http_server) | brain, motor |
-| 3 | LogMotionController **→ HardwareMotionController** + e-stop ISR | brain |
-| 4 | sti_rhino **→ sti_dual(brain, rhino)** | — |
+| 1 | wake_microwakeword + sti_brain + LogMotionController | ws_server, motor, sti_dual fallback |
+| 2 | + ws_viewer_server (esp_http_server) | motor, sti_dual fallback |
+| 3 | LogMotionController **→ HardwareMotionController** + e-stop ISR | sti_dual fallback |
+| 4 | sti_brain **→ sti_dual(brain, fallback)** (fallback 정체 결정 필요) | — |
 | 5 | (변경 없음, Unity가 같은 WS 프로토콜로 접속) | — |
-| 6 | wake_porcupine **→ wake_espsr (옵션)** + DEV_MODE off + 인증/암호화 | manual_trigger |
+| 6 | wake/sti 모델 quality 개선 + DEV_MODE off + 인증/암호화 | manual_trigger |
 
-→ 인터페이스는 변경 없음. 모든 phase 변경은 `main.c`의 factory 호출 교체로 환원.
+→ 인터페이스는 변경 없음. 모든 phase 변경은 `main.c` 의 factory 호출 교체로 환원.
 
 ---
 
@@ -207,20 +209,25 @@ stateDiagram-v2
 |------|------|------|
 | I2S DMA buffer | **Internal RAM** | 낮은 latency 필수 |
 | voice_queue / motion_queue | Internal RAM | 자주 access |
-| Porcupine / Rhino 모델 | PSRAM | 큰 footprint, 한 번 로드 |
-| WS broadcast 큐 페이로드 | Internal RAM | 송신 hot path |
+| microWakeWord .tflite 모델 + TFLite arena | PSRAM | 큰 footprint, 한 번 로드 |
+| brain WS send buffer | Internal RAM | 송신 hot path |
+| WS broadcast 큐 페이로드 (viewer, P2~) | Internal RAM | 송신 hot path |
 | 로그 버퍼 / debug | PSRAM | 비-critical |
-| Phase 4 PCM ring buffer (fallback용) | PSRAM | 5초 × 16kHz × 2 = 160 KB, latency 덜 critical |
+| PCM ring buffer (5초, sti_dual P4 대비) | PSRAM | 5초 × 16kHz × 2 = 160 KB, latency 덜 critical |
 
 ---
 
 ## Latency 예산 (Phase 1 목표)
 
+원래 (Picovoice 가정) 800ms P95 였으나, brain 왕복 포함으로 1500ms P95 로 완화.
+
 | 단계 | P50 | P95 |
 |------|-----|-----|
-| Porcupine wake detect | < 300ms | < 500ms |
-| Rhino intent 추출 | < 150ms | < 250ms |
+| microWakeWord detect (TFLite Micro inference + smoothing) | < 200ms | < 400ms |
+| brain WS roundtrip (Wi-Fi LAN + Whisper inference + intent classifier) | < 600ms | < 1000ms |
 | FSM 검증 + motion start | < 30ms | < 60ms |
-| **End-to-end (wake → motion 시작)** | **< 500ms** | **< 800ms** |
+| **End-to-end (wake → motion 시작)** | **< 900ms** | **< 1500ms** |
 
-측정 위치: `audio_task` 첫 wake 감지 시각 → `motion_task`의 `on_started` 발화 시각, monotonic ms diff.
+측정 위치: `audio_task` 첫 wake 감지 시각 → `motion_task` 의 `on_started` 발화 시각, monotonic ms diff.
+
+(Whisper-base 한국어 RPi 4 기준 약 200~500ms. 모델 사이즈 + RPi 부하에 따라 다름. P1 Gate 전에 실측 후 조정 가능.)

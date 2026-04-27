@@ -1,0 +1,21 @@
+# nubjuk-mcu prototype defaults
+# 보드별 차이 (Quad/Octal PSRAM 등) 는 idf.py menuconfig 로 조정.
+# 변경할 때 같이 갱신해야 하는 파일: partitions.csv (flash 사이즈 변경 시).
+
+# Target
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash & partitions
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# PSRAM 활성. 모드/속도는 menuconfig (보드 의존).
+CONFIG_SPIRAM=y
+
+# FreeRTOS tick 1000Hz (1ms 해상도)
+CONFIG_FREERTOS_HZ=1000
+
+# Log
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

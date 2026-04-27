@@ -2,14 +2,23 @@
 
 > Phase 0 → 1 → 2 → 3 → 4 → 5 → 6 순서대로 진행. 임의로 phase 순서 바꾸지 말 것.
 > 인터페이스 시그니처는 `INTERFACES.md`에 잠금 — 그대로 만족해야 함.
+>
+> **2026-04-27 PIVOT**: Picovoice (Porcupine + Rhino) 가 ESP32-S3 (Xtensa) 에서 실행 불가 발견.
+> Wake = microWakeWord 한국어 (TFLite Micro). STI = brain WS (RPi + Whisper + SLM, 원래 P4 → P1 으로 끌어올림).
+> 인터페이스 (`wake_engine_t` / `sti_engine_t`) 는 변경 없음, 구현체만 swap. 자세한 reasoning 은 `DECISIONS.md` 2026-04-27 entry 참고.
 
-## Phase 0 — 부트스트랩 (mcu 작업 없음)
+## Phase 0 — 부트스트랩 (mcu 작업 + 외부 자원)
 
-mcu 디렉토리는 비어있음. 다음만 준비:
-- [ ] Picovoice Console 계정 생성, AccessKey 발급 (개발 무료 티어)
-- [ ] Wake word `.ppn` 빌드 의뢰: "넙죽 훈련병" (한국어, ESP32-S3 타깃)
-- [ ] Rhino context `.rhn` 빌드 (`rhino/context.yml` 입력)
-- [ ] ESP-IDF v5.x 설치 + ESP32-S3 보드 셋업
+- [x] ESP-IDF v5.x 설치 (v5.2.1 확인) + ESP32-S3 보드 셋업 (DevKitC-1 + ICS43434)
+- [ ] **microWakeWord 한국어 학습 환경** (host Mac 또는 Colab GPU, root 세션):
+  - Python + TensorFlow + microWakeWord 의존
+  - Piper 한국어 voice 모델 (`neurlang/piper-onnx-kss-korean`)
+  - real "넙죽 훈련병" 녹음 5~10명 × 약 20회 (사람 일)
+  - 학습 출력: `wake_nubjuk_ko.tflite` (TFLite Micro 호환)
+- [ ] **brain 모듈** (root 세션, brain/ 디렉토리 신규):
+  - RPi 4 (4GB) + Python + Whisper 한국어 모델 + intent classifier
+  - WS server (포트 + 프로토콜은 `docs/protocol/mcu-brain.md` 잠금 계약)
+  - 같은 LAN 에서 ESP 가 접속
 
 ---
 
@@ -29,30 +38,30 @@ mcu/
 │   ├── state_machine.c|h
 │   ├── config.h
 │   ├── wake/
-│   │   ├── wake_engine.h            # 인터페이스 (잠금)
-│   │   └── wake_engine_porcupine.c  # 구현
+│   │   ├── wake_engine.h               # 인터페이스 (잠금)
+│   │   └── wake_engine_microwakeword.c # 구현 (TFLite Micro)
 │   ├── sti/
-│   │   ├── sti_engine.h             # 인터페이스 (잠금)
-│   │   └── sti_engine_rhino.c       # 구현
+│   │   ├── sti_engine.h                # 인터페이스 (잠금)
+│   │   └── sti_engine_brain.c          # 구현 (WS client to RPi)
 │   ├── coord/
-│   │   ├── voice_coordinator.h      # 인터페이스 (잠금)
-│   │   └── voice_coordinator.c      # 구현
+│   │   ├── voice_coordinator.h         # 인터페이스 (잠금)
+│   │   └── voice_coordinator.c         # 구현
 │   └── motion/
-│       ├── motion_controller.h      # 인터페이스 (잠금)
+│       ├── motion_controller.h         # 인터페이스 (잠금)
 │       ├── motion_registry.c|h
 │       ├── log_motion_controller.c
 │       └── motion_controller_mock.c
-└── components/
-    ├── pv_porcupine/                # Picovoice 라이브러리
-    └── pv_rhino/
+└── managed_components/
+    ├── espressif__esp-tflite-micro/    # idf.py add-dependency 로 추가
+    └── espressif__esp_websocket_client/ # 같은 방식
 ```
 
 ### 구현 task
 
 #### 1.1 Audio capture (single dispatcher + 명시적 fan-out)
-- [ ] I2S 드라이버 init (INMP441 마이크, 16kHz mono PCM)
+- [ ] I2S 드라이버 init (ICS43434 마이크, 16kHz mono PCM, 32-bit slot → int16 변환)
 - [ ] **DMA buffer**: count=4, length=512 samples (32ms), **internal RAM 배치** (PSRAM은 latency 위험)
-- [ ] **Audio frame 슬라이싱**: DMA 32ms → Porcupine/Rhino 요구 frame size로 split (Porcupine ≈ 32ms = 512 samples, Rhino ≈ 32ms 동일)
+- [ ] **Audio frame 슬라이싱**: DMA 32ms = 512 samples 가 microWakeWord / brain WS 양쪽 입력 단위와 동일 → 현 config 에선 slicing no-op (DECISIONS.md 2026-04-27 mic entry 참고). 미래 frame size 변경 시 slicer 들어갈 자리.
 - [ ] **Single dispatcher pattern** (race 방지):
   - `audio_task` (Core 1, prio 22) — DMA에서 읽고 frame slice 후 `voice_queue`에 enqueue. 그 외 작업 X
   - `voice_task` (Core 1, prio 20) — `voice_queue`에서 frame 하나씩 꺼내, **현재 FSM 상태에 따라 라우팅**:
@@ -63,30 +72,32 @@ mcu/
 - [ ] **Diagnostic counters**: dropped_frames, ring_overflow, processing_time_max — heartbeat에 포함
 - [ ] **Frame format 검증**: I2S init 시 sample rate, bit depth, channel count 실측 후 단언
 
-#### 1.2 wake_engine_porcupine
+#### 1.2 wake_engine_microwakeword
 - [ ] `wake_engine_t` 인터페이스 구현 (`init/process_audio/set_callbacks/free`)
-- [ ] Porcupine 핸들 생성 (`.ppn` + AccessKey)
-- [ ] `process_audio`에서 keyword 감지 시 `WAKE_EV_DETECTED` event 발화
+- [ ] `esp-tflite-micro` 컴포넌트 추가 (Espressif TFLite Micro port)
+- [ ] 학습된 `wake_nubjuk_ko.tflite` 모델 embed (`COMPONENT_EMBED_FILES`)
+- [ ] inference 파이프라인: PCM → spectrogram (microWakeWord 가 정한 feature) → TFLite Micro inference → score
+- [ ] score > threshold 시 `WAKE_EV_DETECTED` event 발화
 - [ ] callback 호출은 **voice_task 컨텍스트** (ISR 금지)
+- [ ] threshold + smoothing window 는 학습 시 정해진 값 사용 (FAR/FRR 균형)
 
-#### 1.3 sti_engine_rhino (lifecycle + confidence semantics)
+#### 1.3 sti_engine_brain (WS client to RPi)
 - [ ] `sti_engine_t` 인터페이스 구현 (session lifecycle)
-- [ ] Rhino 핸들 생성 (`.rhn` + AccessKey), 부팅 시 1회 init
-- [ ] **Session lifecycle** (Picovoice Rhino API 매핑):
-  - `start_session(opts)` → Rhino 핸들 reset, `voice_task` 컨텍스트에서 `on_session_started` 즉시 발화
-  - `process_audio(pcm, n)` → `pv_rhino_process(handle, frames, &is_finalized)` 호출
-  - `is_finalized == true` 시 즉시 `pv_rhino_get_intent` → `on_intent` 또는 `on_error` 콜백 1회 발화 (자동 finalize)
-  - `finish_session()` → Rhino 강제 finalize 호출 (utterance 종료 명시 시)
-  - `cancel_session()` → Rhino reset, 콜백 미발화
-- [ ] **Confidence 결정** (Rhino C API는 confidence를 직접 노출하지 않음):
-  - `pv_rhino_is_understood == false` → `intent="unknown"`, confidence=0
-  - `pv_rhino_get_intent` 성공 → confidence=1.0 (Rhino는 이산 결정)
-  - 즉 **사실상 confidence는 0 or 1.0**. "0.6 threshold" 표현은 Phase 4 brain 도입 후에만 의미 있음
-- [ ] `on_error("not_understood")` — Rhino가 utterance를 매칭 못 했을 때
-- [ ] `on_error("session_timeout")` — `max_utterance_ms` 초과해도 finalize 안 됨
-- [ ] **Threading**: 모든 process_audio / 콜백 발화는 `voice_task` 컨텍스트에서. ISR에서 호출 시 ESP_ERR_INVALID_STATE
+- [ ] `esp_websocket_client` 컴포넌트 사용
+- [ ] **Session lifecycle** (`docs/protocol/mcu-brain.md` 계약 준수):
+  - `start_session(opts)` → WS connect (timeout 500ms LAN) + `session_start` JSON 송신, ack 받으면 `voice_task` 컨텍스트에서 `on_session_started` 발화
+  - `process_audio(pcm, n)` → binary frame `[seq_u16 BE][flags_u8][reserved_u8][PCM int16]` 송신
+  - `finish_session()` → `session_end` JSON 송신, intent 응답 대기 (5초 timeout)
+  - brain `intent` 응답 수신 → `on_intent` 콜백
+  - brain `error` 또는 timeout → `on_error` 콜백
+  - `cancel_session()` → `session_cancel` 송신 + WS close, 콜백 미발화
+- [ ] **Confidence**: brain 응답에서 직접 받음 (Whisper + intent classifier 가 산출). 0~1 float.
+- [ ] `on_error("brain_unreachable")` — WS connect 실패 / mid-session drop
+- [ ] `on_error("session_timeout")` — `max_utterance_ms` 초과 또는 brain 응답 없음
+- [ ] **Threading**: process_audio / 콜백 발화는 `voice_task` 컨텍스트에서. ISR 금지.
 - [ ] `set_callbacks` immutable: 이미 등록됐으면 `ESP_ERR_INVALID_STATE`
-- [ ] **Pre-roll 정책**: wake 감지 직후 N ms (예: 200ms) 오디오는 폐기. Rhino는 wake 후 첫 utterance만 처리 (wake word 자체가 utterance 일부로 들어가는 것 방지)
+- [ ] **Pre-roll 정책**: wake 감지 직후 N ms (예: 200ms) 오디오는 폐기 (wake word 자체가 utterance 첫 부분에 새지 않게)
+- [ ] **PCM 버퍼링** (sti_dual local fallback 대비): utterance 시작부터 PSRAM ring buffer (5초 × 16kHz × 2바이트 = 160 KB) 에 저장. local fallback 정체 결정 (`DECISIONS.md` 2026-04-27 entry open question) 에 따라 활용 방식 결정.
 
 #### 1.4 voice_coordinator
 - [ ] `wake.set_callbacks`로 `WAKE_EV_DETECTED` 구독
@@ -127,8 +138,8 @@ mcu/
 - [ ] Wi-Fi 연결 직후 시리얼에 명확히 IP 출력: `>>> ws://192.168.x.x/viewer ready` — Phase 2 viewer 연결 대비 (사용자가 viewer 쪽에 직접 입력)
 - [ ] factory 호출:
   ```c
-  wake_engine_t *wake = wake_porcupine_create(PPN, KEY);
-  sti_engine_t  *sti  = sti_rhino_create(RHN, KEY);
+  wake_engine_t *wake = wake_microwakeword_create(MODEL_PATH);  // embedded .tflite
+  sti_engine_t  *sti  = sti_brain_create(BRAIN_URL);            // ws://rpi.local:port
   motion_controller_t *mc = log_motion_controller_create();
   voice_coordinator_t *coord = voice_coordinator_create(wake, sti);
   state_machine_init(sti, mc);
@@ -153,14 +164,17 @@ mcu/
 
 ### Phase 1 Gate (verification)
 
-- [ ] **한국어 코퍼스 150 샘플 intent accuracy ≥ 90%** (Picovoice Rhino 한국어). 데이터셋 정의: 7 intent × 5 변형 × 3 노이즈(조용/일반/시끄러움) × 2 화자 + 30 distractor. 발화 거리·디바이스 명시
-- [ ] **End-to-end P95 ≤ 800ms** (Porcupine 감지 시각 → motion 모의 시작 시각, ts_ms diff)
-- [ ] Porcupine FAR < 1/시간 (1시간 침묵 + TV/일반 노이즈 1시간 측정)
-- [ ] cycle_timeout 동작 (5초간 발화 안 하면 시리얼에 reject 출력)
-- [ ] `intent="unknown"` 또는 not_understood 시 reject 처리
-- [ ] FSM 모든 전이가 시리얼 로그에 기록됨
-- [ ] 각 task `uxTaskGetStackHighWaterMark` 측정값 ≥ 1 KB headroom
-- [ ] free_heap (executing 중) ≥ 100 KB
+- [ ] **한국어 코퍼스 150 샘플 intent accuracy ≥ 90%** (brain Whisper + intent classifier). 데이터셋 정의: 7 intent × 5 변형 × 3 노이즈(조용/일반/시끄러움) × 2 화자 + 30 distractor. 발화 거리·디바이스 명시.
+- [ ] **End-to-end P95 ≤ 1500ms** (microWakeWord 감지 시각 → motion 모의 시작 시각, ts_ms diff). brain 왕복 포함이라 Picovoice 단독 가정의 800ms 보다 완화.
+- [ ] microWakeWord FAR < 1/시간 (1시간 침묵 + TV/일반 노이즈 1시간 측정).
+- [ ] microWakeWord FRR < 10% (10번 발화 중 9번 이상 감지).
+- [ ] cycle_timeout 동작 (5초간 발화 안 하면 시리얼에 reject 출력).
+- [ ] brain unreachable 시 `error{code:"brain_unreachable"}` 처리.
+- [ ] `intent="unknown"` 또는 brain not_understood 시 reject 처리.
+- [ ] FSM 모든 전이가 시리얼 로그에 기록됨.
+- [ ] 각 task `uxTaskGetStackHighWaterMark` 측정값 ≥ 1 KB headroom.
+- [ ] free_heap (executing 중) ≥ 100 KB.
+- [ ] PSRAM 사용량: TFLite Micro arena + PCM ring buffer + brain WS buffer 합계 측정.
 
 ---
 
@@ -259,43 +273,32 @@ mcu/
 
 ---
 
-## Phase 4 — brain 추가 (선택적)
+## Phase 4 — brain advanced features + sti_dual fallback 정체
 
-**목표**: 자연어 자유도가 필요해질 때 brain 도입. Rhino를 fallback으로 유지.
+**상태**: brain 자체 도입은 P1 으로 끌어올림 (2026-04-27 pivot, `DECISIONS.md` 참고). P4 는 brain 의 advanced 기능 + sti_dual local fallback 정체 결정 슬롯.
 
-### 추가 task
+**목표**: brain 의 단순 single-utterance intent 처리 (P1) 위에 다음을 얹는다.
 
-#### 4.1 sti_engine_brain
-- [ ] `sti_engine_t` 구현 — `esp_websocket_client`로 brain 연결
-- [ ] `start_session` → WS connect + `session_start` JSON 송신
-- [ ] `process_audio` → binary frame `[seq_u16 BE][flags_u8][reserved_u8][PCM]` 송신 (자세한 포맷은 `docs/protocol/mcu-brain.md`)
-- [ ] `finish_session` → `session_end` 송신, intent 응답 대기
-- [ ] `cancel_session` → `session_cancel` 송신 + WS close
-- [ ] brain의 `intent` 응답 수신 → `on_intent` 콜백
-- [ ] `session_busy` / `error` 수신 → `on_error` 콜백
-- [ ] WS connect timeout 500ms (LAN 가정), refused/timeout 모두 → `on_error("brain_unreachable")`
-- [ ] **로컬 PCM 버퍼링**: dual fallback이 가능하도록 utterance 시작부터 PCM을 ring buffer (≤ 5초)에 저장. brain 실패 시 같은 PCM을 Rhino에 feed
+- [ ] sti_dual local fallback 의 정체 결정 (open question, `DECISIONS.md` 2026-04-27 entry):
+  - (i) local fallback 없음 (brain 끊김 → reject)
+  - (ii) intent-as-wake-word: 다수 microWakeWord 모델로 앉아/서/굴러왼/... degraded mode
+  - (iii) PCM 버퍼링 후 재연결 시 재생
+- [ ] sti_dual_create(brain, fallback) 합성 구현 (선택한 fallback 종류에 따라)
+- [ ] **Routing matrix** (시점별, `DECISIONS.md` 의 "원래 P4 routing matrix" 참고):
+  - 세션 시작 전 brain 연결 실패 → fallback 또는 reject
+  - session_busy 응답 → fallback 또는 reject
+  - mid-session WS drop → 버퍼된 PCM 으로 retry 또는 reject
+  - session_end 후 5초 응답 없음 → 같은 처리
+- [ ] (선택) brain 의 multi-turn / context / conversation history 활용
+- [ ] (선택) brain 응답 LLM 기반 자연어 변형 ("좀 앉아볼래?") 인식률 향상
 
-#### 4.2 sti_engine_dual (fallback routing matrix)
-- [ ] `sti_engine_t` 구현 — primary + fallback 합성
-- [ ] **Routing matrix** (시점별):
-  - **세션 시작 전 brain 연결 실패** (timeout/refused) → 즉시 Rhino로
-  - **session_busy 응답** → 즉시 Rhino로
-  - **session_ack 후 mid-session WS drop** → 버퍼된 PCM을 Rhino에 feed (1회 retry)
-  - **session_end 후 응답 없이 5초 경과** → 같은 처리
-  - **schema-invalid 응답** → fail (둘 다 안 함, on_error)
-- [ ] viewer에 fallback 활성 시 `error{code:"brain_unreachable"}` informational push
-- [ ] **PCM 버퍼 크기 제한**: 5초 × 16kHz × 2바이트 = 160 KB (PSRAM에 배치)
+### Phase 4 Gate (선택적)
 
-#### 4.3 main.c factory 변경
-- [ ] `sti_rhino_create()` → `sti_dual_create(brain, rhino)` 로 변경
-- [ ] FSM·voice_coordinator 코드는 **변경 없음**
+- [ ] (fallback 옵션 채택 시) brain 끊김 시 N 초 내 fallback 활성 + intent 응답
+- [ ] (multi-turn 채택 시) 연속 대화 context 유지 검증
+- [ ] sti_dual local fallback 정체 결정이 DECISIONS.md 에 entry 로 남음
 
-### Phase 4 Gate
-- [ ] brain 정상 동작 시 brain 응답 사용
-- [ ] brain 끊김 시 500ms 내 Rhino fallback 활성, 같은 utterance에 대해 결과 반환
-- [ ] viewer가 fallback 발생 시 informational error 표시
-- [ ] 자연어 변형 ("좀 앉아볼래?" 등) 인식률 향상 측정 (Rhino 단독 대비 +20% 이상)
+(이전 v1 plan 의 4.1 sti_engine_brain / 4.2 sti_engine_dual / 4.3 main.c factory 는 brain 이 P1 으로 이동하면서 P1.3 / P1.8 에 통합. v1 의 routing matrix 는 위 본문의 fallback 정체 결정 (i)/(ii)/(iii) 가 정해진 후 다시 들어옴.)
 
 ---
 
@@ -309,10 +312,11 @@ mcu 코드는 그대로. Unity가 같은 WS 프로토콜을 따름.
 
 ## Phase 6 — 양산화
 
-#### 6.1 wake_espsr (선택, 라이선스 비용 절감)
-- [ ] `wake_engine_t` 구현 (`wake_engine_espsr.c`)
-- [ ] ESP-SR Skainet 도구로 "넙죽 훈련병" 모델 학습
-- [ ] FAR/FRR 측정으로 Porcupine과 비교
+#### 6.1 wake 모델 품질 개선 (선택)
+- [ ] microWakeWord 한국어 모델 retrain (필드 데이터 수집 후)
+- [ ] FAR/FRR 양산 환경에서 측정 (집/사무실/시끄러운 곳)
+- [ ] (선택) ESP-SR WakeNet 한국어 custom 학습 의뢰 → wake_engine_espsr 추가 구현체 (대안 옵션)
+- [ ] (선택) Picovoice 가 ESP32 SDK 출시한 경우 wake_porcupine 추가 구현체 (호환성 옵션)
 
 #### 6.2 DEV_MODE 비활성
 - [ ] sdkconfig `CONFIG_NUBJUK_DEV_MODE=n`
