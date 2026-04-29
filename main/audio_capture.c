@@ -17,10 +17,13 @@ static i2s_chan_handle_t rx_chan = NULL;
 static volatile uint32_t s_dropped = 0;
 
 // I2S DMA 가 ICS43434 의 24-bit data 를 32-bit slot 의 MSB align 으로 전달.
+// STEREO 모드 + slot_mask LEFT: DMA 는 (L,R) interleaved 로 받지만, 우리는 left 만 keep
+// (ICS43434 L/R=GND → left slot 에 데이터, right slot 은 high-Z).
 // 상위 16 bits 만 추출 (>> 16) 해서 int16_t voice frame 으로 변환.
 static void audio_task(void *arg)
 {
-    const size_t raw_bytes = AUDIO_FRAME_SAMPLES * sizeof(int32_t);
+    const size_t raw_samples = AUDIO_FRAME_SAMPLES * 2;            // L + R interleaved
+    const size_t raw_bytes   = raw_samples * sizeof(int32_t);
     int32_t *raw = malloc(raw_bytes);
     if (!raw) {
         ESP_LOGE(TAG, "raw buf malloc fail");
@@ -42,7 +45,7 @@ static void audio_task(void *arg)
             continue;
         }
         for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
-            frame[i] = (int16_t)(raw[i] >> 16);
+            frame[i] = (int16_t)(raw[i * 2] >> 16);                // left slot
         }
 
         if (xQueueSend(voice_queue, &frame, 0) != pdTRUE) {
@@ -66,7 +69,7 @@ esp_err_t audio_capture_init(void)
 
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = MIC_BCLK_GPIO,

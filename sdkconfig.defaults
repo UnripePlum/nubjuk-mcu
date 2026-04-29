@@ -1,18 +1,21 @@
 # nubjuk-mcu prototype defaults
-# 보드별 차이 (Quad/Octal PSRAM 등) 는 idf.py menuconfig 로 조정.
-# 변경할 때 같이 갱신해야 하는 파일: partitions.csv (flash 사이즈 변경 시).
+# 대상 보드: ESP32-S3-DevKitC-1 N16R8 (16MB QSPI flash + 8MB Octal PSRAM).
+# 보드 변경 시 PSRAM 모드/속도, FLASHSIZE, partitions.csv 동시 조정.
 
 # Target
 CONFIG_IDF_TARGET="esp32s3"
 
 # Flash & partitions
+# 보드는 16MB flash 지만 partitions.csv 가 8MB 안에서 잡혀있어 8MB 로 운용. P6 양산 시 16MB 로 확장 고려.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
-# PSRAM 활성. 모드/속도는 menuconfig (보드 의존).
+# PSRAM — N16R8 = Octal 8MB. 80MHz 권장 (Octal 지원 한계). Quad 로 잡으면 boot 실패.
 CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
 
 # FreeRTOS tick 1000Hz (1ms 해상도)
 CONFIG_FREERTOS_HZ=1000

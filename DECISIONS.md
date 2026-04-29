@@ -123,3 +123,46 @@
   - 이 결정으로 `docs/plans/mcu-p0-p1.md` SUPERSEDED.
   - 신규 plan: `docs/plans/mcu-p0-p1-v2.md`.
   - PHASES.md 상단 pivot 노트 추가.
+
+### 2026-04-29 — 보드 변종 = N16R8, PSRAM Octal 80MHz pinned
+
+- **결정**:
+  - 사용 보드: ESP32-S3-DevKitC-1 **N16R8** (16MB QSPI flash + 8MB Octal PSRAM).
+  - `sdkconfig.defaults` 에 `CONFIG_SPIRAM_MODE_OCT=y` + `CONFIG_SPIRAM_SPEED_80M=y` 명시. 더 이상 menuconfig 의존 X.
+  - flash size 는 8MB 로 유지 (보드는 16MB 지만 partitions.csv 가 8MB 안에 들어감, 전환은 P6).
+- **Trigger**: P1.1 보드 첫 monitor 실행 시 `quad_psram: PSRAM ID read error: 0x00ffffff` → `cpu_start: Failed to init external RAM!` panic. ESP-IDF 의 idf.py set-target esp32s3 기본값이 Quad PSRAM 인데 N16R8 은 Octal.
+- **Rationale**:
+  - sdkconfig.defaults 에 명시 = 새 워킹카피/CI/다른 머신에서도 같은 빌드. "menuconfig 에서 조정" 같은 사람-의존 설정은 prototype 단계엔 안 맞음.
+  - 80MHz: Octal PSRAM 의 표준 속도. 40MHz Quad 대비 대역폭 4×. SRAM 부족 시 buffer 옮길 때 latency margin.
+  - flash 16MB 로 안 올림: partitions.csv 변경 + OTA 슬롯 재배치 = 별개 결정 = 별개 entry. 지금 8MB 에 6% 사용이라 불편 0.
+- **거부한 대안**:
+  - **PSRAM 비활성** (`CONFIG_SPIRAM=n`): 가장 단순. 거부 이유: 곧 microWakeWord 모델 + brain WS frame 버퍼 + log queue 가 들어옴, 8MB 외부 RAM 있는데 안 쓸 이유 없음.
+  - **`CONFIG_SPIRAM_IGNORE_NOTFOUND=y`**: 부팅은 되지만 PSRAM alloc 호출이 silent 실패. 지금 코드는 PSRAM alloc 안 하지만 future caps_alloc(MALLOC_CAP_SPIRAM) 에서 NULL → null deref 위험.
+  - **menuconfig 만 조정 (defaults 안 건드림)**: 워킹카피 sdkconfig 만 바뀌고 reset/clean 시 사라짐. 같은 함정에 다시 빠짐.
+- **깨졌던 시나리오**: 첫 boot 자체. monitor 안 띄우고 flash 만 했던 P0 단계에선 발견 못 함. **flash 후 반드시 monitor 1회 boot log 확인** 을 작업 흐름에 추가 필요 (PHASES.md P1.1 Gate 에 반영 후보).
+- **재검토 시점**:
+  - 다른 보드 변종으로 옮길 때 (N8/N8R2/N8R8): defaults 의 PSRAM mode + flash size 동시 갱신.
+  - PSRAM 사용량이 의미 있게 늘면 SPIRAM_USE_CAPS_ALLOC 으로 전환 검토 (현재는 USE_MALLOC = 자동 fallback).
+
+### 2026-04-29 — I2S slot_mode = STEREO + 수동 deinterleave (이전 MONO 결정 부분 supersede)
+
+이전 mic entry (`Mic = ICS43434, ...`) 의 "MONO mode → DMA 대역폭 절반 + de-interleave 불필요" 가정이 v5.2 에선 사실이 아님. slot_cfg 만 supersede; 나머지 (24-bit MSB align, `>> 16`, 16kHz, 32-bit slot, GPIO 매핑) 그대로.
+
+- **결정**:
+  - `slot_cfg` 의 slot_mode 를 `I2S_SLOT_MODE_STEREO` 로 명시.
+  - audio_task: raw buffer = `2 * AUDIO_FRAME_SAMPLES * sizeof(int32_t)` (L,R interleaved). loop 에서 `frame[i] = (int16_t)(raw[i*2] >> 16)` 로 left slot 만 추출.
+  - voice_queue payload (int16 mono 16kHz, 512 samples) 는 변동 없음. wake/sti 인터페이스 영향 0.
+- **Trigger**: P1.1 첫 정상 boot 후 self-check rate = 62.5/s 관측. 기대값 31.25/s 의 정확히 2× → DMA 가 실제로 left+right 두 슬롯 데이터를 모두 buffer 에 넣고 있음을 시사. peak 변동 자체는 정상이라 (right slot = ICS43434 high-Z ≈ 0) 결과는 사용 가능했지만 frame rate 계약이 깨짐.
+- **Rationale**:
+  - v5.2 의 `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(..., MONO)` 는 `slot_mask = LEFT` 까지 포함하지만, 실제 DMA 는 두 슬롯 데이터를 모두 적재 (slot mask 가 hardware level 에서 RX 적재를 거르지 않음). docs 와 다른 동작이라 entry 로 박제.
+  - STEREO 로 명시하면 driver 동작이 hardware 와 일치 → version-upgrade resilient. wake_engine / sti_engine 은 항상 16kHz mono int16 frame 을 받으므로 외부에선 변경 없음.
+  - 메모리 cost: raw buffer 2×. 1 frame raw = 4096 bytes, voice_queue depth 8 의 raw 점유 = 4096 (single rotating buffer in audio_task). int16 frame 은 전과 동일 (1024 bytes × queue depth 8). 무시 가능.
+- **거부한 대안**:
+  - **MONO 유지 + raw buffer 만 2× allocate + stride-by-2**: slot_mode 와 처리 방식이 어긋나 다음 사람이 코드 읽을 때 혼란. STEREO 로 명시하는 편이 정직.
+  - **slot_bit_width 16-bit 로 축소**: ICS43434 24-bit MSB align 데이터가 잘림. wake 인식률 저하 위험. 거부.
+  - **dma_frame_num 절반 (256) 으로 축소**: rate 는 맞춰지지만 여전히 right slot 데이터를 받아서 버리는 구조. 메모리/시간 낭비.
+  - **i2s legacy driver (`driver/i2s.h`) 로 회귀**: deprecated. NG.
+- **깨졌던 시나리오**: 수정 전 frame rate = 62.5/s = 32kHz effective. 만약 wake/sti 가 그대로 받았으면 모델 입력 sample rate mismatch 로 인식률 0 에 수렴 했을 것. peak 검증이 있어서 직전 단계에서 잡힘. **self-check 단계에서 rate 검증을 명시적으로 한 게 가치 입증**.
+- **재검토 시점**:
+  - ESP-IDF v5.3+ 에서 MONO mode 의 동작이 docs 와 일치하도록 수정되면 (release notes 확인) MONO 로 회귀 가능. 그때 raw buffer 절반 + stride 제거.
+  - 듀얼 마이크 (P3+ noise cancel) 진입 시 right slot 도 사용 → STEREO 그대로, deinterleave 만 양쪽 다 keep.
